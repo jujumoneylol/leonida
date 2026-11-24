@@ -708,6 +708,87 @@ int main() {
         CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib) == (order{3, 1, 2}));
     }
 
+    // Low-VRAM budget policy & placement (GTX 1650 4 GB vs RTX 5070 Ti 16 GB vs UMA).
+    {
+        constexpr VkMemoryPropertyFlags local = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        constexpr VkMemoryPropertyFlags host =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        constexpr VkDeviceSize mib = VkDeviceSize(1) << 20;
+        constexpr VkDeviceSize gib = VkDeviceSize(1) << 30;
+        using order = std::vector<std::uint32_t>;
+
+        // GTX 1650 Mobile (4 GB VRAM, 32 GB RAM -> 16 GB shared heap, 214 MiB BAR heap).
+        VkPhysicalDeviceMemoryProperties gtx1650{};
+        gtx1650.memoryHeapCount = 3;
+        gtx1650.memoryHeaps[0] = {4 * gib, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+        gtx1650.memoryHeaps[1] = {16 * gib, 0};
+        gtx1650.memoryHeaps[2] = {214 * mib, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+        gtx1650.memoryTypeCount = 4;
+        gtx1650.memoryTypes[0] = {local, 0};
+        gtx1650.memoryTypes[1] = {host, 1};
+        gtx1650.memoryTypes[2] = {host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 1};
+        gtx1650.memoryTypes[3] = {local | host, 2};
+
+        CHECK(max_device_local_heap_bytes(gtx1650) == 4 * gib);
+        const VramPolicy auto_1650 = decide_vram_policy(gtx1650, false, nullptr, nullptr);
+        CHECK(auto_1650.enabled && auto_1650.auto_detected);
+        CHECK(auto_1650.reserve_bytes == 512 * mib);
+
+        // Explicit overrides: LEONIDA_LOW_VRAM=0 disables even on 4 GB; LEONIDA_VRAM_RESERVE_MB clamps to 64..2048.
+        CHECK(!decide_vram_policy(gtx1650, false, "0", nullptr).enabled);
+        CHECK(!decide_vram_policy(gtx1650, false, "off", nullptr).enabled);
+        CHECK(decide_vram_policy(gtx1650, false, "1", "256").reserve_bytes == 256 * mib);
+        CHECK(decide_vram_policy(gtx1650, false, "1", "16").reserve_bytes == 64 * mib);
+        CHECK(decide_vram_policy(gtx1650, false, "1", "9999").reserve_bytes == 2048 * mib);
+        // UMA iGPUs do not auto-enable low-VRAM spillover.
+        CHECK(!decide_vram_policy(gtx1650, true, nullptr, nullptr).enabled);
+
+        // 16 GB discrete card stays off by default, unless explicitly forced on.
+        VkPhysicalDeviceMemoryProperties big_gpu = gtx1650;
+        big_gpu.memoryHeaps[0].size = 16 * gib;
+        CHECK(!decide_vram_policy(big_gpu, false, nullptr, nullptr).enabled);
+        CHECK(decide_vram_policy(big_gpu, false, "1", nullptr).enabled);
+
+        // Plenty of VRAM headroom: spillable still prefers DEVICE_LOCAL first.
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        budget.heapBudget[0] = 3500 * mib;
+        budget.heapUsage[0] = 1000 * mib;
+        budget.heapBudget[1] = 16000 * mib;
+        budget.heapUsage[1] = 200 * mib;
+        budget.heapBudget[2] = 214 * mib;
+        budget.heapUsage[2] = 200 * mib;
+        bool steered = false;
+        CHECK(memory_type_order_budgeted(gtx1650, 0xF, 0, local, 64 * mib, MemoryPriority::spillable, &budget,
+                                         auto_1650, &steered) == (order{0, 1, 2, 3}));
+        CHECK(!steered);
+
+        // Under VRAM pressure (usage 3000 + size 64 + reserve 512 = 3576 > budget 3500):
+        // spillable demotes DEVICE_LOCAL behind system memory (types 1, 2) while keeping local (0, 3) as fallback.
+        budget.heapUsage[0] = 3000 * mib;
+        CHECK(memory_type_order_budgeted(gtx1650, 0xF, 0, local, 64 * mib, MemoryPriority::spillable, &budget,
+                                         auto_1650, &steered) == (order{1, 2, 0, 3}));
+        CHECK(steered);
+
+        // Critical (render target / depth buffer) STILL gets DEVICE_LOCAL first under the exact same pressure!
+        steered = true;
+        CHECK(memory_type_order_budgeted(gtx1650, 0xF, 0, local, 64 * mib, MemoryPriority::critical, &budget,
+                                         auto_1650, &steered) == (order{0, 3, 1, 2}));
+        CHECK(!steered);
+
+        // Explicit soft VRAM cap (LEONIDA_VRAM_CAP_MB) triggers steering even when driver budget looks roomy.
+        CHECK(memory_allocation_priority(MemoryPriority::critical) == 1.0f);
+        CHECK(memory_allocation_priority(MemoryPriority::spillable) < 0.5f);
+        const VramPolicy capped = decide_vram_policy(big_gpu, false, nullptr, "256", "1024");
+        CHECK(capped.enabled && capped.vram_cap_bytes == 1024 * mib && capped.reserve_bytes == 256 * mib);
+        budget.heapBudget[0] = 12000 * mib;
+        budget.heapUsage[0] = 800 * mib;
+        steered = false;
+        CHECK(memory_type_order_budgeted(big_gpu, 0xF, 0, local, 64 * mib, MemoryPriority::spillable, &budget,
+                                         capped, &steered) == (order{1, 2, 0, 3}));
+        CHECK(steered);
+    }
+
     // block_format: bytes per texel, or per 4x4 block for block-compressed formats, of one aspect as a copy lays a
     // subresource out in a buffer. Each expected size is the format's own texel/block size, derived independently of
     // the table under test, so a mistyped entry (a wrong byte count or a missed 4x4 block) is caught before it

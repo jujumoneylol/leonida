@@ -193,6 +193,17 @@ struct VulkanDeviceInfo {
     // minImportedHostPointerAlignment): OpenExistingHeapFromAddress backs a heap with the caller's own committed
     // memory. Zero: existing heaps stay unsupported.
     VkDeviceSize host_pointer_alignment = 0;
+    // VK_EXT_memory_budget is enabled on `device`: live per-heap VRAM budget and usage can be queried through
+    // vkGetPhysicalDeviceMemoryProperties2 so low-VRAM GPUs proactively steer spillable resources to system memory.
+    bool memory_budget = false;
+    // VK_EXT_memory_priority is enabled on `device`: critical render targets/depth buffers get 1.0 residency priority
+    // while spillable textures/buffers get 0.25 so the OS pager never evicts active framebuffers first.
+    bool memory_priority = false;
+    // VK_EXT_pageable_device_local_memory is enabled on `device`: allows graceful paging under VRAM pressure instead
+    // of hard VK_ERROR_OUT_OF_DEVICE_MEMORY failures.
+    bool pageable_device_local_memory = false;
+    // LEONIDA_RT_AS=off explicitly disabled ray tracing acceleration structures for non-RT / low-VRAM GPUs.
+    bool rt_disabled = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
@@ -275,6 +286,23 @@ bool device_push_constants_need_fallback(ID3D12Device* device);
 // True when `device` puts upload-heap buffers in DEVICE_LOCAL | HOST_VISIBLE memory: its GPU has Resizable BAR and
 // LEONIDA_UPLOAD_SYSMEM is not set (D3D-96).
 bool device_upload_in_vram(ID3D12Device* device);
+
+// Low-VRAM budget protection state and spillover counters for `device` (all zeros/false when not a Vulkan device).
+struct VramBudgetStats {
+    bool low_vram_mode = false;
+    bool auto_detected = false;
+    bool memory_budget_ext = false;
+    bool memory_priority_ext = false;
+    bool pageable_memory_ext = false;
+    std::uint64_t device_local_bytes = 0;
+    std::uint64_t reserve_bytes = 0;
+    std::uint64_t vram_cap_bytes = 0;
+    std::uint64_t steered_allocations = 0;
+    std::uint64_t steered_bytes = 0;
+    std::uint64_t forced_spill_allocations = 0;
+    std::uint64_t forced_spill_bytes = 0;
+};
+VramBudgetStats device_vram_stats(ID3D12Device* device);
 
 // True when the device can map reserved buffers onto its D3D12 heaps.
 bool device_sparse_buffer_tiles(ID3D12Device* device);

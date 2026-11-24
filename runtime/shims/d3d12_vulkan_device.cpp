@@ -572,6 +572,21 @@ struct DeviceState {
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
     bool upload_in_vram = false;
+    // Low-VRAM budget protection (VK_EXT_memory_budget + VK_EXT_memory_priority): auto-enabled on discrete <=4.5 GiB
+    // GPUs (e.g. GTX 1650) or controlled via LEONIDA_LOW_VRAM=1/0, LEONIDA_VRAM_RESERVE_MB, and LEONIDA_VRAM_CAP_MB.
+    leonida::VramPolicy vram_policy{};
+    PFN_vkGetPhysicalDeviceMemoryProperties2 memory_properties2 = nullptr;
+    bool vram_log = false;  // LEONIDA_VRAM_LOG=1: log each proactively steered allocation
+    mutable std::mutex budget_mutex;
+    mutable VkPhysicalDeviceMemoryBudgetPropertiesEXT cached_budget{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    mutable bool budget_valid = false;
+    mutable VkDeviceSize pending_local_bytes = 0;  // DEVICE_LOCAL bytes allocated since last driver budget query
+    mutable std::once_flag steer_logged;
+    mutable std::atomic<std::uint64_t> steered_allocations{0};
+    mutable std::atomic<std::uint64_t> steered_bytes{0};
+    mutable std::atomic<std::uint64_t> forced_spill_allocations{0};
+    mutable std::atomic<std::uint64_t> forced_spill_bytes{0};
     // D3D-299: the first texture or default-heap buffer that lands outside device-local memory is logged, once.
     mutable std::once_flag spill_logged;
 
@@ -1364,32 +1379,101 @@ struct DeviceState {
     }
 
     // A memory type with `required`, preferring one that also has `preferred`, in a heap large enough for the
-    // allocation (leonida::memory_type_order). `chosen`, when given, receives the property flags of the type the
-    // memory came from.
+    // allocation (leonida::memory_type_order / memory_type_order_budgeted). `chosen`, when given, receives the
+    // property flags of the type the memory came from.
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags required,
                             VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen = nullptr,
-                            bool device_address = false, std::uint32_t* chosen_type = nullptr) const {
+                            bool device_address = false, std::uint32_t* chosen_type = nullptr,
+                            leonida::MemoryPriority priority = leonida::MemoryPriority::critical) const {
         VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
         flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-        for (const std::uint32_t i :
-             leonida::memory_type_order(memory, requirements.memoryTypeBits, required, preferred, requirements.size)) {
+        VkMemoryPriorityAllocateInfoEXT priority_info{VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT};
+        priority_info.priority = leonida::memory_allocation_priority(priority);
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        const VkPhysicalDeviceMemoryBudgetPropertiesEXT* budget_ptr = nullptr;
+        if (vram_policy.enabled && priority == leonida::MemoryPriority::spillable && info.memory_budget &&
+            memory_properties2 && info.physical) {
+            constexpr VkDeviceSize kLargeAllocRefresh = VkDeviceSize(1) << 20;
+            constexpr VkDeviceSize kPendingRefreshDelta = VkDeviceSize(16) << 20;
+            std::lock_guard lock(budget_mutex);
+            if (!budget_valid || requirements.size >= kLargeAllocRefresh ||
+                pending_local_bytes >= kPendingRefreshDelta) {
+                VkPhysicalDeviceMemoryProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+                                                         &cached_budget};
+                memory_properties2(info.physical, &props2);
+                budget_valid = true;
+                pending_local_bytes = 0;
+            }
+            budget = cached_budget;
+            if (pending_local_bytes > 0) {
+                for (std::uint32_t h = 0; h < memory.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; ++h) {
+                    if (memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                        budget.heapUsage[h] += pending_local_bytes;
+                }
+            }
+            budget_ptr = &budget;
+        }
+        bool steered = false;
+        const auto order = leonida::memory_type_order_budgeted(
+            memory, requirements.memoryTypeBits, required, preferred, requirements.size, priority, budget_ptr,
+            vram_policy, &steered);
+        for (const std::uint32_t i : order) {
             VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            if (device_address) allocate.pNext = &flags_info;
+            void* pnext = nullptr;
+            if (info.memory_priority) {
+                priority_info.pNext = pnext;
+                pnext = &priority_info;
+            }
+            if (device_address) {
+                flags_info.pNext = pnext;
+                pnext = &flags_info;
+            }
+            allocate.pNext = pnext;
             allocate.allocationSize = requirements.size;
             allocate.memoryTypeIndex = i;
             VkDeviceMemory out = VK_NULL_HANDLE;
             if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
                 if (chosen) *chosen = memory.memoryTypes[i].propertyFlags;
                 if (chosen_type) *chosen_type = i;
-                if (leonida::spilled_to_host(required, preferred, memory.memoryTypes[i].propertyFlags))
-                    std::call_once(spill_logged, [&] {
-                        const std::uint32_t heap = memory.memoryTypes[i].heapIndex;
-                        std::fprintf(stderr,
-                                     "[rt] d3d12: a %llu-byte allocation did not fit in device-local memory and went "
-                                     "to memory type %u (heap %u, %llu MiB); later ones are not logged\n",
-                                     static_cast<unsigned long long>(requirements.size), i, heap,
-                                     static_cast<unsigned long long>(memory.memoryHeaps[heap].size >> 20));
-                    });
+                if (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+                    std::lock_guard lock(budget_mutex);
+                    pending_local_bytes += requirements.size;
+                }
+                if (leonida::spilled_to_host(required, preferred, memory.memoryTypes[i].propertyFlags)) {
+                    const std::uint32_t heap = memory.memoryTypes[i].heapIndex;
+                    if (steered) {
+                        steered_allocations.fetch_add(1, std::memory_order_relaxed);
+                        steered_bytes.fetch_add(requirements.size, std::memory_order_relaxed);
+                        if (vram_log) {
+                            std::fprintf(stderr,
+                                         "[rt] d3d12: low-vram steered %llu-byte spillable allocation to system memory "
+                                         "(type %u, heap %u)\n",
+                                         static_cast<unsigned long long>(requirements.size), i, heap);
+                        } else {
+                            std::call_once(steer_logged, [&] {
+                                std::fprintf(stderr,
+                                             "[rt] d3d12: low-vram budget guard steered a %llu-byte spillable "
+                                             "allocation to system memory (type %u, heap %u, %llu MiB) to preserve "
+                                             "%llu MiB VRAM headroom for render targets; set LEONIDA_VRAM_LOG=1 for "
+                                             "each one\n",
+                                             static_cast<unsigned long long>(requirements.size), i, heap,
+                                             static_cast<unsigned long long>(memory.memoryHeaps[heap].size >> 20),
+                                             static_cast<unsigned long long>(vram_policy.reserve_bytes >> 20));
+                            });
+                        }
+                    } else {
+                        forced_spill_allocations.fetch_add(1, std::memory_order_relaxed);
+                        forced_spill_bytes.fetch_add(requirements.size, std::memory_order_relaxed);
+                        std::call_once(spill_logged, [&] {
+                            std::fprintf(stderr,
+                                         "[rt] d3d12: a %llu-byte allocation did not fit in device-local memory and "
+                                         "went to memory type %u (heap %u, %llu MiB); later ones are not logged\n",
+                                         static_cast<unsigned long long>(requirements.size), i, heap,
+                                         static_cast<unsigned long long>(memory.memoryHeaps[heap].size >> 20));
+                        });
+                    }
+                }
                 return out;
             }
         }
@@ -1916,7 +2000,7 @@ public:
                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                           host_preferred, &memory_flags_, addressable || need_bda)
                        : device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_,
-                                          addressable || need_bda);
+                                          addressable || need_bda, nullptr, leonida::MemoryPriority::spillable);
         if (!memory_ || vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS)
             return E_OUTOFMEMORY;
         if (addressable) {
@@ -2238,7 +2322,15 @@ public:
         }
         VkMemoryRequirements requirements{};
         vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
-        memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
+        // Keep render targets, depth-stencil buffers, and MSAA targets pinned in DEVICE_LOCAL VRAM; plain sampled/UAV
+        // textures may proactively steer to system memory when low-VRAM headroom is tight.
+        const bool critical_texture =
+            samples > 1 || (desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                           D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
+        const auto priority =
+            critical_texture ? leonida::MemoryPriority::critical : leonida::MemoryPriority::spillable;
+        memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_, false,
+                                   nullptr, priority);
         if (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) != VK_SUCCESS)
             return E_OUTOFMEMORY;
 
@@ -2859,8 +2951,8 @@ public:
             if (!image) memory_types = device_.sparse_buffer_memory_types;
             const VkMemoryRequirements requirements{desc_.SizeInBytes, leonida::tile_size_in_bytes,
                                                     memory_types};
-            const auto memory = device_.allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
-                                                  nullptr, !image, &memory_type);
+            const auto memory = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                 nullptr, !image, &memory_type, leonida::MemoryPriority::spillable);
             if (!memory) return {};
             image_tiles_ = image;
             tile_allocation_ = std::shared_ptr<const leonida::TileHeapAllocation>(
@@ -5093,6 +5185,12 @@ public:
         state_.bgra8_srgb_uav_emulated =
             state_.probe_uint_backed_uav(VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM);
         memory_properties(info.physical, &state_.memory);
+        state_.memory_properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties2"));
+        if (!state_.memory_properties2) {
+            state_.memory_properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties2KHR"));
+        }
         {
             char text[4] = {};
             size_t length = 0;
@@ -5102,6 +5200,40 @@ public:
                          state_.upload_in_vram ? "VRAM (DEVICE_LOCAL | HOST_VISIBLE, Resizable BAR)"
                          : sysmem             ? "system memory (LEONIDA_UPLOAD_SYSMEM)"
                                               : "system memory (no Resizable BAR)");
+        }
+        {
+            VkPhysicalDeviceProperties init_props{};
+            device_properties(info.physical, &init_props);
+            const bool is_uma = init_props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+            char low_vram[16] = {};
+            char reserve_mb[16] = {};
+            char cap_mb[16] = {};
+            char log_vram[4] = {};
+            size_t low_len = 0, res_len = 0, cap_len = 0, log_len = 0;
+            const char* low_ptr =
+                (getenv_s(&low_len, low_vram, "LEONIDA_LOW_VRAM") == 0 && low_len > 1) ? low_vram : nullptr;
+            const char* res_ptr =
+                (getenv_s(&res_len, reserve_mb, "LEONIDA_VRAM_RESERVE_MB") == 0 && res_len > 1) ? reserve_mb : nullptr;
+            const char* cap_ptr =
+                (getenv_s(&cap_len, cap_mb, "LEONIDA_VRAM_CAP_MB") == 0 && cap_len > 1) ? cap_mb : nullptr;
+            state_.vram_log = getenv_s(&log_len, log_vram, "LEONIDA_VRAM_LOG") == 0 && log_len > 1 && log_vram[0] != '0';
+            state_.vram_policy = leonida::decide_vram_policy(state_.memory, is_uma, low_ptr, res_ptr, cap_ptr);
+            if (state_.vram_policy.enabled) {
+                char cap_text[32] = {};
+                if (state_.vram_policy.vram_cap_bytes) {
+                    std::snprintf(cap_text, sizeof(cap_text), ", cap=%llu MiB",
+                                  static_cast<unsigned long long>(state_.vram_policy.vram_cap_bytes >> 20));
+                }
+                std::fprintf(stderr,
+                             "[rt] d3d12: low-VRAM survival mode ON (%s; %llu MiB VRAM, %llu MiB reserved%s, "
+                             "budget=%s, priority=%s, pageable=%s)\n",
+                             state_.vram_policy.auto_detected ? "auto <=4.5 GiB GPU" : "env",
+                             static_cast<unsigned long long>(state_.vram_policy.device_local_bytes >> 20),
+                             static_cast<unsigned long long>(state_.vram_policy.reserve_bytes >> 20), cap_text,
+                             info.memory_budget && state_.memory_properties2 ? "on" : "off",
+                             info.memory_priority ? "on" : "off",
+                             info.pageable_device_local_memory ? "on" : "off");
+            }
         }
         for (const char* name : {"vkGetDeviceImageMemoryRequirements", "vkGetDeviceImageMemoryRequirementsKHR"})
             if (!state_.image_requirements)
@@ -5935,6 +6067,14 @@ public:
             out->ResultDataMaxSizeInBytes = layout.size;
             out->ScratchDataSizeInBytes = layout.scratch;
             out->UpdateScratchDataSizeInBytes = layout.scratch;
+            return;
+        }
+        if (state_.info.rt_disabled) {
+            // LEONIDA_RT_AS=off: return minimal 256-byte aligned sizes so titles that query prebuild sizes and
+            // allocate buffers without checking RaytracingTier do not divide by or allocate zero bytes.
+            out->ResultDataMaxSizeInBytes = 256;
+            out->ScratchDataSizeInBytes = 256;
+            out->UpdateScratchDataSizeInBytes = 256;
             return;
         }
         if (!state_.info.ray_tracing || !vk.vkGetAccelerationStructureBuildSizesKHR) return;
@@ -9055,6 +9195,29 @@ bool device_upload_in_vram(ID3D12Device* device) {
     return false;
 }
 
+VramBudgetStats device_vram_stats(ID3D12Device* device) {
+    VramBudgetStats stats{};
+    if (!device) return stats;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    const Device* d = Device::from<Device>(real);
+    if (!d) return stats;
+    const auto& s = d->state();
+    stats.low_vram_mode = s.vram_policy.enabled;
+    stats.auto_detected = s.vram_policy.auto_detected;
+    stats.memory_budget_ext = s.info.memory_budget && s.memory_properties2 != nullptr;
+    stats.memory_priority_ext = s.info.memory_priority;
+    stats.pageable_memory_ext = s.info.pageable_device_local_memory;
+    stats.device_local_bytes = s.vram_policy.device_local_bytes;
+    stats.reserve_bytes = s.vram_policy.reserve_bytes;
+    stats.vram_cap_bytes = s.vram_policy.vram_cap_bytes;
+    stats.steered_allocations = s.steered_allocations.load(std::memory_order_relaxed);
+    stats.steered_bytes = s.steered_bytes.load(std::memory_order_relaxed);
+    stats.forced_spill_allocations = s.forced_spill_allocations.load(std::memory_order_relaxed);
+    stats.forced_spill_bytes = s.forced_spill_bytes.load(std::memory_order_relaxed);
+    return stats;
+}
+
 bool device_sparse_buffer_tiles(ID3D12Device* device) {
     const Device* d = Device::from<Device>(device);
     return d && d->state().sparse_buffer_memory_types != 0;
@@ -9545,12 +9708,20 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
             info.ray_tracing = as_features.accelerationStructure == VK_TRUE && rq_features.rayQuery == VK_TRUE;
         }
         // The game's translated RT shaders read XDXR BVH4 records, which a VkAccelerationStructureKHR is not
-        // (docs/d3d12_vulkan.md 4.8): build those, unless LEONIDA_RT_AS=khr asks for #743's KHR builds instead.
-        char rt_as[8] = {};
+        // (docs/d3d12_vulkan.md 4.8): build those, unless LEONIDA_RT_AS=khr asks for #743's KHR builds instead, or
+        // LEONIDA_RT_AS=off disables acceleration structure builds completely for non-RT / low-VRAM GPUs.
+        char rt_as[16] = {};
         std::size_t rt_as_length = 0;
-        const bool khr = getenv_s(&rt_as_length, rt_as, "LEONIDA_RT_AS") == 0 && rt_as_length > 1 &&
-                         std::strcmp(rt_as, "khr") == 0;
-        if (!khr && chosen12.bufferDeviceAddress) {
+        const bool rt_as_set = getenv_s(&rt_as_length, rt_as, "LEONIDA_RT_AS") == 0 && rt_as_length > 1;
+        const bool khr = rt_as_set && std::strcmp(rt_as, "khr") == 0;
+        const bool rt_off = rt_as_set && (std::strcmp(rt_as, "off") == 0 || std::strcmp(rt_as, "none") == 0 ||
+                                          std::strcmp(rt_as, "0") == 0);
+        if (rt_off) {
+            info.xdxr_acceleration_structures = false;
+            info.ray_tracing = false;
+            info.rt_disabled = true;
+            std::fprintf(stderr, "[rt] d3d12: ray tracing acceleration structures disabled (LEONIDA_RT_AS=%s)\n", rt_as);
+        } else if (!khr && chosen12.bufferDeviceAddress) {
             info.xdxr_acceleration_structures = true;
             info.ray_tracing = false;  // no KHR extensions: AS resources keep their console VAs
         }
@@ -9925,6 +10096,43 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                      "[rt] d3d12: no VK_EXT_custom_border_color; custom sampler border colours fall back to transparent black\n");
     }
 
+    // Optional: VK_EXT_memory_budget lets low-VRAM GPUs query real-time heap budget/usage so spillable textures
+    // proactively spill to system RAM before exhausting VRAM needed by render targets and depth buffers.
+    info.memory_budget = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+        return std::strcmp(e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0;
+    });
+
+    // Optional: VK_EXT_memory_priority + VK_EXT_pageable_device_local_memory give critical render targets/depth
+    // buffers 1.0 residency priority over spillable textures (0.25) and allow graceful paging under VRAM pressure.
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT mem_priority_feat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT};
+    const bool has_mem_priority = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+        return std::strcmp(e.extensionName, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) == 0;
+    });
+    if (has_mem_priority) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &mem_priority_feat};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.memory_priority = mem_priority_feat.memoryPriority == VK_TRUE;
+        if (info.memory_priority) {
+            mem_priority_feat.pNext = *v13.next();
+            *v13.next() = &mem_priority_feat;
+        }
+    }
+    VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageable_feat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT};
+    const bool has_pageable = info.memory_priority && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+        return std::strcmp(e.extensionName, VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME) == 0;
+    });
+    if (has_pageable) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &pageable_feat};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.pageable_device_local_memory = pageable_feat.pageableDeviceLocalMemory == VK_TRUE;
+        if (info.pageable_device_local_memory) {
+            pageable_feat.pNext = *v13.next();
+            *v13.next() = &pageable_feat;
+        }
+    }
+
     // Optional: VK_EXT_external_memory_host lets OpenExistingHeapFromAddress import the caller's committed memory as
     // the heap's backing, so the GPU reads what the CPU writes there without a copy.
     if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
@@ -9973,6 +10181,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    if (info.memory_budget) device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (info.memory_priority) device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+    if (info.pageable_device_local_memory)
+        device_extensions.push_back(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
