@@ -2422,7 +2422,7 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         fail("unknown feature unexpectedly answered");
 
     // Local invariants for what this layer actually implements.
-    if (o2.DepthBoundsTestSupported ||
+    if (o2.DepthBoundsTestSupported != (info.features.depthBounds ? TRUE : FALSE) ||
         o2.ProgrammableSamplePositionsTier != D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED)
         fail("OPTIONS2 unexpected support");
     if (o3.CopyQueueTimestampQueriesSupported || o3.CastingFullyTypedFormatSupported ||
@@ -2470,6 +2470,21 @@ int compare_feature_options(ID3D12Device* ours, const rt::d3d12::VulkanDeviceInf
         o21.ExecuteIndirectTier != rt::d3d12::compat::kExecuteIndirectTier1_0 ||
         o21.SampleCmpGradientAndBiasSupported || o21.ExtendedCommandInfoSupported)
         fail("OPTIONS21 unexpected support");
+
+    // Verify OPTIONS2.DepthBoundsTestSupported follows VulkanDeviceInfo::features.depthBounds.
+    {
+        rt::d3d12::VulkanDeviceInfo toggled_info = info;
+        toggled_info.features.depthBounds = info.features.depthBounds ? VK_FALSE : VK_TRUE;
+        Ref<ID3D12Device> toggled;
+        if (FAILED(rt::d3d12::create_vulkan_device(toggled_info, IID_PPV_ARGS(&toggled.p)))) {
+            fail("failed to create toggled depthBounds device");
+        } else {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS2 toggled2{};
+            if (FAILED(toggled->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS2, &toggled2, sizeof(toggled2))) ||
+                toggled2.DepthBoundsTestSupported != (toggled_info.features.depthBounds ? TRUE : FALSE))
+                fail("OPTIONS2.DepthBoundsTestSupported did not follow features.depthBounds");
+        }
+    }
 
     // Verify OPTIONS19.AnisoFilterWithPointMipSupported follows VulkanDeviceInfo::sampler_anisotropy.
     {

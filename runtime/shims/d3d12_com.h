@@ -176,7 +176,7 @@ struct VulkanDeviceInfo {
     // D3D12_MESH_SHADER_TIER_1; without it mesh PSOs are refused and the tier is NOT_SUPPORTED.
     bool mesh_shader = false;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
-    // depthBiasClamp or dualSrcBlend are refused unless it is set here.
+    // depthBiasClamp, dualSrcBlend, logicOp, depthClamp or depthBounds are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
     // Vulkan 1.2 shaderOutputLayer / shaderOutputViewportIndex enabled on `device`: a translated vertex shader that
     // writes the layer or viewport declares ShaderLayer / ShaderViewportIndex (the index's `features`).

@@ -102,7 +102,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdPushConstants) X(vkCmdDispatch)                                                                     \
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
-    X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
+    X(vkCmdSetBlendConstants) X(vkCmdSetDepthBounds) X(vkCmdDraw)                                                      \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
@@ -133,8 +133,8 @@ struct VulkanDeviceFunctions {
                vkCreateShaderModule && vkDestroyShaderModule && vkCreatePipelineLayout &&
                vkDestroyPipelineLayout && vkCreateComputePipelines && vkDestroyPipeline &&
                vkGetBufferDeviceAddress && vkCmdBindIndexBuffer && vkCmdSetViewport && vkCmdSetScissor &&
-               vkCmdSetStencilReference && vkCmdSetBlendConstants && vkCmdDraw && vkCmdDrawIndexed &&
-               vkCreateGraphicsPipelines;
+               vkCmdSetStencilReference && vkCmdSetBlendConstants && vkCmdSetDepthBounds && vkCmdDraw &&
+               vkCmdDrawIndexed && vkCreateGraphicsPipelines;
     }
 
     // Graphics pipelines also need these Vulkan 1.3 entry points (dynamic rendering, extended dynamic state).
@@ -974,6 +974,7 @@ public:
         replay_.set_primitive_restart_enable = vk.vkCmdSetPrimitiveRestartEnable;
         replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
         replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
+        replay_.set_depth_bounds = vk.vkCmdSetDepthBounds;
         replay_.draw = vk.vkCmdDraw;
         replay_.draw_mesh_tasks = vk.vkCmdDrawMeshTasksEXT;  // null unless VK_EXT_mesh_shader is enabled
         replay_.draw_indexed = vk.vkCmdDrawIndexed;

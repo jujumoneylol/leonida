@@ -3245,6 +3245,7 @@ struct PipelineStream {
     D3D12_SHADER_BYTECODE as{};
     bool has_cs = false;
     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
+    bool depth_bounds_test = false;
 };
 
 HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, PipelineStream& out) {
@@ -3354,10 +3355,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
             D3D12_DEPTH_STENCIL_DESC1 d{};
             take(d);
-            if (ok && d.DepthBoundsTestEnable) {
-                log_once("depth-bounds tests are not supported yet; stream subobject", int(type));
-                return E_NOTIMPL;
-            }
+            if (ok) out.depth_bounds_test = d.DepthBoundsTestEnable != FALSE;
             g.DepthStencilState = {d.DepthEnable, d.DepthWriteMask, d.DepthFunc, d.StencilEnable, d.StencilReadMask,
                                    d.StencilWriteMask, d.FrontFace, d.BackFace};
             break;
@@ -3366,10 +3364,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             D3D12_DEPTH_STENCIL_DESC2 d{};
             take(d);
             if (!ok) break;
-            if (d.DepthBoundsTestEnable) {
-                log_once("depth-bounds tests are not supported yet; stream subobject", int(type));
-                return E_NOTIMPL;
-            }
+            out.depth_bounds_test = d.DepthBoundsTestEnable != FALSE;
             // Separate front and back stencil masks are not modelled (one read and one write mask per PSO).
             if (d.StencilEnable && (d.FrontFace.StencilReadMask != d.BackFace.StencilReadMask ||
                                     d.FrontFace.StencilWriteMask != d.BackFace.StencilWriteMask)) {
@@ -3523,7 +3518,7 @@ public:
     // no VS, no vertex input or input assembly (the input layout, topology type and strip cut are ignored, as D3D12
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
-                            const D3D12_SHADER_BYTECODE* as = nullptr) {
+                            const D3D12_SHADER_BYTECODE* as = nullptr, bool depth_bounds_test = false) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
@@ -3910,6 +3905,9 @@ public:
         depth.depthTestEnable = ds.DepthEnable;
         depth.depthWriteEnable = ds.DepthEnable && ds.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
         depth.depthCompareOp = compare_op(ds.DepthFunc);
+        depth.depthBoundsTestEnable = depth_bounds_test ? VK_TRUE : VK_FALSE;
+        depth.minDepthBounds = 0.0f;
+        depth.maxDepthBounds = 1.0f;
         depth.stencilTestEnable = ds.StencilEnable;
         depth.front = stencil_face(ds.FrontFace, ds.StencilReadMask, ds.StencilWriteMask);
         depth.back = stencil_face(ds.BackFace, ds.StencilReadMask, ds.StencilWriteMask);
@@ -3983,6 +3981,9 @@ public:
             return refuse("logic ops need logicOp, which the device lacks; op", int(first.LogicOp));
         if (raster.depthClampEnable && !features.depthClamp)
             return refuse("DepthClipEnable = FALSE needs depthClamp, which the device lacks; flag", 0);
+        if (depth.depthBoundsTestEnable && !features.depthBounds)
+            return refuse("DepthBoundsTestEnable = TRUE needs depthBounds, which the device lacks; flag", 1);
+        graphics_.depth_bounds = depth_bounds_test;
 
         graphics_.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
@@ -4237,14 +4238,6 @@ private:
 
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
     VkPipeline build(std::uint32_t unbound) const {
-        // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
-        // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
-        // (VUID-vkCmdDraw-pStrides-04913).
-        static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
-            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-            VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
         const Recipe& r = recipe_;
         std::vector<VkFormat> colors = graphics_.color_formats;
         for (std::size_t slot = 0; slot < colors.size(); ++slot)
@@ -4289,17 +4282,23 @@ private:
         blend.pAttachments = r.blends.data();
         // A mesh pipeline takes neither the topology nor the strides as dynamic state
         // (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065 and -07066).
-        static constexpr VkDynamicState mesh_dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                                                 VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                                                                 VK_DYNAMIC_STATE_BLEND_CONSTANTS};
-        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        if (r.mesh) {
-            dynamic.dynamicStateCount = std::uint32_t(std::size(mesh_dynamic_states));
-            dynamic.pDynamicStates = mesh_dynamic_states;
-        } else {
-            dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (r.bindings.empty() ? 1 : 0);
-            dynamic.pDynamicStates = dynamic_states;
+        // A pipeline without vertex bindings leaves out VERTEX_INPUT_BINDING_STRIDE (VUID-vkCmdDraw-pStrides-04913).
+        // DEPTH_BOUNDS is added only when depthBoundsTestEnable is set so non-bounds pipelines need not set it.
+        VkDynamicState dyn_list[8]{};
+        std::uint32_t dyn_count = 0;
+        dyn_list[dyn_count++] = VK_DYNAMIC_STATE_VIEWPORT;
+        dyn_list[dyn_count++] = VK_DYNAMIC_STATE_SCISSOR;
+        if (!r.mesh) {
+            dyn_list[dyn_count++] = VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY;
+            dyn_list[dyn_count++] = VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE;
         }
+        dyn_list[dyn_count++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
+        dyn_list[dyn_count++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;
+        if (!r.mesh && !r.bindings.empty()) dyn_list[dyn_count++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
+        if (r.depth.depthBoundsTestEnable) dyn_list[dyn_count++] = VK_DYNAMIC_STATE_DEPTH_BOUNDS;
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamic.dynamicStateCount = dyn_count;
+        dynamic.pDynamicStates = dyn_list;
 
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
         info.stageCount = std::uint32_t(r.stages.size());
@@ -6365,8 +6364,9 @@ public:
         if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
-        const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
-                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as);
+        const HRESULT hr =
+            stream.has_cs ? pipeline->create_compute(stream.compute)
+                          : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as, stream.depth_bounds_test);
         if (FAILED(hr)) {
             pipeline->Release();
             return d3d12_trace::result(method, hr);
@@ -7829,7 +7829,7 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS2)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS2*>(data);
             *opts = {};
-            opts->DepthBoundsTestSupported = FALSE;
+            opts->DepthBoundsTestSupported = state_.info.features.depthBounds ? TRUE : FALSE;
             opts->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
             return d3d12_trace::result(method, S_OK);
         }
@@ -10011,6 +10011,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     enable.dualSrcBlend = chosen_features.dualSrcBlend;
     enable.logicOp = chosen_features.logicOp;
     enable.depthClamp = chosen_features.depthClamp;
+    enable.depthBounds = chosen_features.depthBounds;
     enable.geometryShader = chosen_features.geometryShader;  // translated geometry shaders (195 in the corpus)
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
     // 26,503 entries), doubles, 16-bit integers, clip and cull distances in a few vertex shaders, image stores

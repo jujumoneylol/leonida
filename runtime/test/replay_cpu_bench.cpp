@@ -230,6 +230,7 @@ struct Scene {
         vk.set_primitive_restart_enable = nop<PFN_vkCmdSetPrimitiveRestartEnable>();
         vk.set_stencil_reference = nop<PFN_vkCmdSetStencilReference>();
         vk.set_blend_constants = nop<PFN_vkCmdSetBlendConstants>();
+        vk.set_depth_bounds = nop<PFN_vkCmdSetDepthBounds>();
         vk.draw = nop<PFN_vkCmdDraw>();
         vk.draw_indexed = nop<PFN_vkCmdDrawIndexed>();
     }

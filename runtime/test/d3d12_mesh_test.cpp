@@ -263,11 +263,17 @@ int main() {
         bad = mesh_stream;
         bad.add(AsSubobject{.inner = vs});
         EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+        // DepthBoundsTestEnable follows VkPhysicalDeviceFeatures::depthBounds.
         bad = mesh_stream;
         D3D12_DEPTH_STENCIL_DESC1 bounds{};
         bounds.DepthBoundsTestEnable = TRUE;
         bad.add(DepthStencil1Subobject{.inner = bounds});
-        EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+        if (vk.enabled.depthBounds) {
+            Ref<ID3D12PipelineState> bounds_pso;
+            EXPECT(SUCCEEDED(create(device.p, bad, bounds_pso)) && bounds_pso.p);
+        } else {
+            EXPECT(create(device.p, bad, refused) == E_NOTIMPL && !refused.p);
+        }
 
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
