@@ -414,6 +414,15 @@ struct DrawViews {
     std::uint32_t render_target_count = 8;
 };
 
+// Shared across draws that keep the same multi-viewport / multi-scissor state (null for the common 1-viewport case).
+struct DrawViewports {
+    static constexpr std::uint32_t max_count = 16;
+    std::array<Viewport, max_count> viewports{};
+    std::uint32_t viewport_count = 0;
+    std::array<Rect, max_count> scissors{};
+    std::uint32_t scissor_count = 0;
+};
+
 // DrawInstanced / DrawIndexedInstanced / DispatchMesh, with everything they use captured when they are recorded:
 // D3D12 reads render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the
 // list's state at the draw. resource 0 marks an unbound render-target slot or no depth buffer. A mesh draw
@@ -442,6 +451,7 @@ struct Draw {
     bool mesh = false;
     float depth_bounds_min = 0.0f;
     float depth_bounds_max = 1.0f;
+    std::shared_ptr<const DrawViewports> viewports;  // non-null when >1 viewport or >1 scissor was bound
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.

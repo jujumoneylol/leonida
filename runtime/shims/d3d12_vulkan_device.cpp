@@ -3985,6 +3985,9 @@ public:
             return refuse("DepthBoundsTestEnable = TRUE needs depthBounds, which the device lacks; flag", 1);
         graphics_.depth_bounds = depth_bounds_test;
 
+        graphics_.viewport_with_count =
+            features.multiViewport && vk.vkCmdSetViewportWithCount && vk.vkCmdSetScissorWithCount;
+
         graphics_.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
@@ -4264,8 +4267,10 @@ private:
         vertex_input.vertexAttributeDescriptionCount = std::uint32_t(r.attributes.size());
         vertex_input.pVertexAttributeDescriptions = r.attributes.data();
         VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-        viewport.viewportCount = 1;
-        viewport.scissorCount = 1;
+        if (!graphics_.viewport_with_count) {
+            viewport.viewportCount = 1;
+            viewport.scissorCount = 1;
+        }
         VkPipelineMultisampleStateCreateInfo multisample = r.multisample;
         VkPipelineRasterizationStateCreateInfo raster = r.raster;
         VkPipelineRasterizationConservativeStateCreateInfoEXT conservative{
@@ -4282,12 +4287,14 @@ private:
         blend.pAttachments = r.blends.data();
         // A mesh pipeline takes neither the topology nor the strides as dynamic state
         // (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065 and -07066).
-        // A pipeline without vertex bindings leaves out VERTEX_INPUT_BINDING_STRIDE (VUID-vkCmdDraw-pStrides-04913).
+        // With multiViewport enabled, VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT allow 1..16 dynamic viewports/scissors.
         // DEPTH_BOUNDS is added only when depthBoundsTestEnable is set so non-bounds pipelines need not set it.
         VkDynamicState dyn_list[8]{};
         std::uint32_t dyn_count = 0;
-        dyn_list[dyn_count++] = VK_DYNAMIC_STATE_VIEWPORT;
-        dyn_list[dyn_count++] = VK_DYNAMIC_STATE_SCISSOR;
+        dyn_list[dyn_count++] =
+            graphics_.viewport_with_count ? VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT : VK_DYNAMIC_STATE_VIEWPORT;
+        dyn_list[dyn_count++] =
+            graphics_.viewport_with_count ? VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT : VK_DYNAMIC_STATE_SCISSOR;
         if (!r.mesh) {
             dyn_list[dyn_count++] = VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY;
             dyn_list[dyn_count++] = VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE;
@@ -10014,6 +10021,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     enable.depthClamp = chosen_features.depthClamp;
     enable.depthBounds = chosen_features.depthBounds;
     enable.multiDrawIndirect = chosen_features.multiDrawIndirect;
+    enable.multiViewport = chosen_features.multiViewport;
     enable.geometryShader = chosen_features.geometryShader;  // translated geometry shaders (195 in the corpus)
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
     // 26,503 entries), doubles, 16-bit integers, clip and cull distances in a few vertex shaders, image stores

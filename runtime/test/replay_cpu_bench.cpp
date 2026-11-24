@@ -226,6 +226,8 @@ struct Scene {
         vk.bind_index_buffer = nop<PFN_vkCmdBindIndexBuffer>();
         vk.set_viewport = nop<PFN_vkCmdSetViewport>();
         vk.set_scissor = nop<PFN_vkCmdSetScissor>();
+        vk.set_viewport_with_count = nop<PFN_vkCmdSetViewportWithCount>();
+        vk.set_scissor_with_count = nop<PFN_vkCmdSetScissorWithCount>();
         vk.set_primitive_topology = nop<PFN_vkCmdSetPrimitiveTopology>();
         vk.set_primitive_restart_enable = nop<PFN_vkCmdSetPrimitiveRestartEnable>();
         vk.set_stencil_reference = nop<PFN_vkCmdSetStencilReference>();
