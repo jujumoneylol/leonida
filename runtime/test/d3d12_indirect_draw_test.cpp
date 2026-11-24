@@ -393,6 +393,197 @@ bool run_case(ID3D12Device* dev, const Programs& p, const IndirectCase& c, std::
     return true;
 }
 
+// Runs clear, ExecuteIndirect, and readback copy in three separate command lists so a rejected ExecuteIndirect list
+// (e.g. counted draw without Vulkan drawIndirectCount) leaves the target cleanly cleared without blocking readback.
+bool run_split_case(ID3D12Device* dev, const Programs& p, const IndirectCase& c, std::vector<std::uint8_t>& pixels_out) {
+    Ref<ID3D12RootSignature> root;
+    if (FAILED(dev->CreateRootSignature(0, p.root.data(), p.root.size(), IID_PPV_ARGS(&root.p)))) return false;
+
+    const D3D12_INPUT_ELEMENT_DESC layout[2] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 8, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = root.p;
+    pd.VS = {p.vs.data(), p.vs.size()};
+    pd.PS = {p.ps.data(), p.ps.size()};
+    for (auto& rt : pd.BlendState.RenderTarget) {
+        rt.SrcBlend = rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rt.DestBlend = rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rt.BlendOp = rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.DepthStencilState.DepthEnable = FALSE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    pd.InputLayout = {layout, 2};
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc = {1, 0};
+    Ref<ID3D12PipelineState> pso;
+    if (FAILED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso.p)))) return false;
+
+    D3D12_INDIRECT_ARGUMENT_DESC arg_desc{};
+    arg_desc.Type = c.indexed ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    D3D12_COMMAND_SIGNATURE_DESC sig_desc{c.stride, 1, &arg_desc, 0};
+    Ref<ID3D12CommandSignature> sig;
+    if (FAILED(dev->CreateCommandSignature(&sig_desc, nullptr, IID_PPV_ARGS(&sig.p)))) return false;
+
+    const D3D12_HEAP_PROPERTIES def_heap{D3D12_HEAP_TYPE_DEFAULT};
+    const D3D12_HEAP_PROPERTIES up_heap{D3D12_HEAP_TYPE_UPLOAD};
+    const D3D12_HEAP_PROPERTIES rb_heap{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = td.Height = 8;
+    td.DepthOrArraySize = td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc = {1, 0};
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    Ref<ID3D12Resource> target;
+    if (FAILED(dev->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                            nullptr, IID_PPV_ARGS(&target.p))))
+        return false;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT foot{};
+    UINT rows = 0;
+    UINT64 row_bytes = 0, total = 0;
+    dev->GetCopyableFootprints(&td, 0, 1, 0, &foot, &rows, &row_bytes, &total);
+    Ref<ID3D12Resource> readback;
+    const auto rb_desc = d3d12test::buffer_desc(total);
+    if (FAILED(dev->CreateCommittedResource(&rb_heap, D3D12_HEAP_FLAG_NONE, &rb_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                            nullptr, IID_PPV_ARGS(&readback.p))))
+        return false;
+
+    Ref<ID3D12Resource> vb_up, vb_def, ib_up, ib_def, arg_up, arg_def, cnt_up, cnt_def;
+    const auto vb_desc = d3d12test::buffer_desc(sizeof(kVertices));
+    const auto ib_desc = d3d12test::buffer_desc(sizeof(kIndices));
+    const std::size_t arg_bytes = std::max<std::size_t>(256, std::size_t(c.stride) * 4);
+    const auto arg_buf_desc = d3d12test::buffer_desc(arg_bytes);
+    const auto cnt_buf_desc = d3d12test::buffer_desc(64);
+    if (FAILED(dev->CreateCommittedResource(&up_heap, D3D12_HEAP_FLAG_NONE, &vb_desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                            nullptr, IID_PPV_ARGS(&vb_up.p))) ||
+        FAILED(dev->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &vb_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                            nullptr, IID_PPV_ARGS(&vb_def.p))) ||
+        FAILED(dev->CreateCommittedResource(&up_heap, D3D12_HEAP_FLAG_NONE, &ib_desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                            nullptr, IID_PPV_ARGS(&ib_up.p))) ||
+        FAILED(dev->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &ib_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                            nullptr, IID_PPV_ARGS(&ib_def.p))) ||
+        FAILED(dev->CreateCommittedResource(&up_heap, D3D12_HEAP_FLAG_NONE, &arg_buf_desc,
+                                            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&arg_up.p))) ||
+        FAILED(dev->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &arg_buf_desc,
+                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&arg_def.p))) ||
+        FAILED(dev->CreateCommittedResource(&up_heap, D3D12_HEAP_FLAG_NONE, &cnt_buf_desc,
+                                            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&cnt_up.p))) ||
+        FAILED(dev->CreateCommittedResource(&def_heap, D3D12_HEAP_FLAG_NONE, &cnt_buf_desc,
+                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&cnt_def.p))))
+        return false;
+
+    std::vector<std::uint8_t> arg_data(arg_bytes, 0);
+    if (c.indexed) {
+        const D3D12_DRAW_INDEXED_ARGUMENTS a0{6, 1, 0, 0, 0}, a1{6, 1, 0, 6, 0};
+        std::memcpy(arg_data.data(), &a0, sizeof(a0));
+        std::memcpy(arg_data.data() + c.stride, &a1, sizeof(a1));
+    } else {
+        const D3D12_DRAW_ARGUMENTS a0{6, 1, 0, 0}, a1{6, 1, 6, 0};
+        std::memcpy(arg_data.data(), &a0, sizeof(a0));
+        std::memcpy(arg_data.data() + c.stride, &a1, sizeof(a1));
+    }
+    const std::uint32_t count_val = c.gpu_count;
+    if (!upload_bytes(vb_up.p, kVertices, sizeof(kVertices)) || !upload_bytes(ib_up.p, kIndices, sizeof(kIndices)) ||
+        !upload_bytes(arg_up.p, arg_data.data(), arg_data.size()) || !upload_bytes(cnt_up.p, &count_val, sizeof(count_val)))
+        return false;
+
+    Ref<ID3D12DescriptorHeap> rtv_heap;
+    const D3D12_DESCRIPTOR_HEAP_DESC rh{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+    if (FAILED(dev->CreateDescriptorHeap(&rh, IID_PPV_ARGS(&rtv_heap.p)))) return false;
+    const auto rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    dev->CreateRenderTargetView(target.p, nullptr, rtv);
+
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> alloc1, alloc2, alloc3;
+    Ref<ID3D12GraphicsCommandList> list1, list2, list3;
+    Ref<ID3D12Fence> fence;
+    const D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue.p))) ||
+        FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc1.p))) ||
+        FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc2.p))) ||
+        FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc3.p))) ||
+        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc1.p, nullptr, IID_PPV_ARGS(&list1.p))) ||
+        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc2.p, pso.p, IID_PPV_ARGS(&list2.p))) ||
+        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc3.p, nullptr, IID_PPV_ARGS(&list3.p))) ||
+        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
+        return false;
+
+    // List 1: upload buffers & clear target to blue.
+    list1->CopyResource(vb_def.p, vb_up.p);
+    list1->CopyResource(ib_def.p, ib_up.p);
+    list1->CopyResource(arg_def.p, arg_up.p);
+    list1->CopyResource(cnt_def.p, cnt_up.p);
+    const D3D12_RESOURCE_BARRIER barriers[4] = {
+        d3d12test::transition(vb_def.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
+        d3d12test::transition(ib_def.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDEX_BUFFER),
+        d3d12test::transition(arg_def.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+        d3d12test::transition(cnt_def.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+    };
+    list1->ResourceBarrier(4, barriers);
+    const FLOAT clear_blue[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+    list1->ClearRenderTargetView(rtv, clear_blue, 0, nullptr);
+    if (FAILED(list1->Close())) return false;
+
+    // List 2: ExecuteIndirect alone (rejected when drawIndirectCount is disabled).
+    list2->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    const D3D12_VIEWPORT vp{0.0f, 0.0f, 8.0f, 8.0f, 0.0f, 1.0f};
+    const D3D12_RECT sc{0, 0, 8, 8};
+    list2->RSSetViewports(1, &vp);
+    list2->RSSetScissorRects(1, &sc);
+    list2->SetGraphicsRootSignature(root.p);
+    list2->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_VERTEX_BUFFER_VIEW vbv{vb_def->GetGPUVirtualAddress(), sizeof(kVertices), sizeof(Vertex)};
+    list2->IASetVertexBuffers(0, 1, &vbv);
+    if (c.indexed) {
+        const D3D12_INDEX_BUFFER_VIEW ibv{ib_def->GetGPUVirtualAddress(), sizeof(kIndices), DXGI_FORMAT_R16_UINT};
+        list2->IASetIndexBuffer(&ibv);
+    }
+    list2->ExecuteIndirect(sig.p, c.max_count, arg_def.p, 0, c.use_count_buffer ? cnt_def.p : nullptr, 0);
+    if (FAILED(list2->Close())) return false;
+
+    // List 3: transition & copy target to readback.
+    const auto to_src = d3d12test::transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                              D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list3->ResourceBarrier(1, &to_src);
+    D3D12_TEXTURE_COPY_LOCATION src_loc{target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    src_loc.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst_loc{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    dst_loc.PlacedFootprint = foot;
+    list3->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+    if (FAILED(list3->Close())) return false;
+
+    ID3D12CommandList* l1[] = {list1.p};
+    ID3D12CommandList* l2[] = {list2.p};
+    ID3D12CommandList* l3[] = {list3.p};
+    queue->ExecuteCommandLists(1, l1);
+    queue->ExecuteCommandLists(1, l2);
+    queue->ExecuteCommandLists(1, l3);
+    if (FAILED(queue->Signal(fence.p, 1)) || FAILED(fence->SetEventOnCompletion(1, nullptr))) return false;
+
+    void* mapped = nullptr;
+    const D3D12_RANGE range{0, static_cast<SIZE_T>(total)};
+    if (FAILED(readback->Map(0, &range, &mapped)) || !mapped) return false;
+    pixels_out.resize(8 * 8 * 4);
+    for (UINT y = 0; y < 8; ++y) {
+        std::memcpy(pixels_out.data() + y * 32,
+                    static_cast<const std::uint8_t*>(mapped) + foot.Offset + y * foot.Footprint.RowPitch, 32);
+    }
+    const D3D12_RANGE empty{0, 0};
+    readback->Unmap(0, &empty);
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -430,6 +621,7 @@ int main() {
     info.bindless_partially_bound = vk.partially_bound;
     info.host_image_copy = vk.host_image_copy;
     info.buffer_device_address = vk.buffer_device_address;
+    info.draw_indirect_count = vk.draw_indirect_count;
     info.features = vk.enabled;
     info.shader_dir = library.string();
 
@@ -498,9 +690,93 @@ int main() {
         std::printf(" OK\n");
     }
 
+    // Custom device with multiDrawIndirect deliberately disabled: fixed multi-draw must fall back to drawCount=1
+    // calls with identical output and zero Vulkan validation errors (no VUID-vkCmdDrawIndirect-drawCount-02718).
+    {
+        vktest::Device no_multi;
+        no_multi.request_buffer_device_address = true;
+        no_multi.request_multi_draw_indirect = false;
+        CHECK(no_multi.initialize() == vktest::DeviceStatus::ready);
+        CHECK(no_multi.enabled.multiDrawIndirect == VK_FALSE);
+        rt::d3d12::VulkanDeviceInfo ni{};
+        ni.get_instance_proc = no_multi.instance_proc;
+        ni.instance = no_multi.instance;
+        ni.physical = no_multi.physical;
+        ni.device = no_multi.device;
+        ni.queue = no_multi.queue;
+        ni.queue_family = no_multi.family;
+        ni.bindless = no_multi.bindless;
+        ni.bindless_partially_bound = no_multi.partially_bound;
+        ni.host_image_copy = no_multi.host_image_copy;
+        ni.buffer_device_address = no_multi.buffer_device_address;
+        ni.draw_indirect_count = no_multi.draw_indirect_count;
+        ni.features = no_multi.enabled;
+        ni.shader_dir = library.string();
+        Ref<ID3D12Device> dev;
+        CHECK(SUCCEEDED(rt::d3d12::create_vulkan_device(ni, IID_PPV_ARGS(&dev.p))));
+        const IndirectCase multi_cases[] = {
+            {"no-multiDrawIndirect: DRAW max=2 stride=16", false, false, 16, 2, 2, true, true},
+            {"no-multiDrawIndirect: DRAW max=2 stride=24", false, false, 24, 2, 2, true, true},
+            {"no-multiDrawIndirect: DRAW_INDEXED max=2 stride=20", true, false, 20, 2, 2, true, true},
+            {"no-multiDrawIndirect: DRAW_INDEXED max=2 stride=28", true, false, 28, 2, 2, true, true},
+        };
+        for (const IndirectCase& c : multi_cases) {
+            std::vector<std::uint8_t> px;
+            CHECK(run_case(dev.p, our_programs, c, px));
+            const std::uint8_t* left = px.data() + (4 * 8 + 2) * 4;
+            const std::uint8_t* right = px.data() + (4 * 8 + 6) * 4;
+            CHECK(left[0] == 255 && left[1] == 0 && left[2] == 0);
+            CHECK(right[0] == 0 && right[1] == 255 && right[2] == 0);
+            std::printf("  %-52s L=(%3u,%3u,%3u) R=(%3u,%3u,%3u) OK\n", c.name, left[0], left[1], left[2], right[0],
+                        right[1], right[2]);
+        }
+        CHECK(no_multi.validation_errors() == 0);
+    }
+
+    // Custom device with drawIndirectCount deliberately disabled: counted draws must be refused cleanly at replay
+    // (leaving the cleared target untouched) with zero Vulkan validation errors (no VUID-vkCmdDrawIndirectCount-None-04445).
+    {
+        vktest::Device no_count;
+        no_count.request_buffer_device_address = true;
+        no_count.request_draw_indirect_count = false;
+        CHECK(no_count.initialize() == vktest::DeviceStatus::ready);
+        CHECK(!no_count.draw_indirect_count);
+        rt::d3d12::VulkanDeviceInfo ni{};
+        ni.get_instance_proc = no_count.instance_proc;
+        ni.instance = no_count.instance;
+        ni.physical = no_count.physical;
+        ni.device = no_count.device;
+        ni.queue = no_count.queue;
+        ni.queue_family = no_count.family;
+        ni.bindless = no_count.bindless;
+        ni.bindless_partially_bound = no_count.partially_bound;
+        ni.host_image_copy = no_count.host_image_copy;
+        ni.buffer_device_address = no_count.buffer_device_address;
+        ni.draw_indirect_count = no_count.draw_indirect_count;
+        ni.features = no_count.enabled;
+        ni.shader_dir = library.string();
+        Ref<ID3D12Device> dev;
+        CHECK(SUCCEEDED(rt::d3d12::create_vulkan_device(ni, IID_PPV_ARGS(&dev.p))));
+        const IndirectCase gated_cases[] = {
+            {"no-drawIndirectCount: DRAW counted refused", false, true, 16, 2, 2, false, false},
+            {"no-drawIndirectCount: DRAW_INDEXED counted refused", true, true, 20, 2, 2, false, false},
+        };
+        for (const IndirectCase& c : gated_cases) {
+            std::vector<std::uint8_t> px;
+            CHECK(run_split_case(dev.p, our_programs, c, px));
+            const std::uint8_t* left = px.data() + (4 * 8 + 2) * 4;
+            const std::uint8_t* right = px.data() + (4 * 8 + 6) * 4;
+            CHECK(left[0] == 0 && left[1] == 0 && left[2] == 255);
+            CHECK(right[0] == 0 && right[1] == 0 && right[2] == 255);
+            std::printf("  %-52s L=(%3u,%3u,%3u) R=(%3u,%3u,%3u) OK\n", c.name, left[0], left[1], left[2], right[0],
+                        right[1], right[2]);
+        }
+        CHECK(no_count.validation_errors() == 0);
+    }
+
     std::filesystem::remove_all(library);
     CHECK(vk.validation_errors() == 0);
-    std::printf("d3d12_indirect_draw_test: ALL %zu CASES PASSED%s\n", std::size(cases),
+    std::printf("d3d12_indirect_draw_test: ALL %zu + 6 FEATURE-GATING CASES PASSED%s\n", std::size(cases),
                 have_host ? " (EXACT MATCH vs host D3D12)" : "");
     return 0;
 }

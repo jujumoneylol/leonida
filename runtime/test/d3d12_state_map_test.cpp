@@ -622,6 +622,46 @@ int main() {
         arguments.buffer_offset = UINT64_MAX - 3;
         CHECK(rejected({IndirectKind::dispatch, 12, 1, 1, 0, 0, 0}));
         CHECK(offsets == expected);
+
+        // Feature gating: multiDrawIndirect=false splits fixed multi-draw into drawCount=1 calls at offset + k*stride;
+        // missing draw_indirect_count rejects counted draws with max_count > 0 as unsupported (max_count=0 stays ok).
+        arguments.buffer_offset = 256;
+        static std::vector<std::pair<VkDeviceSize, std::uint32_t>> split_draws;
+        split_draws.clear();
+        ReplayFunctions gated = vk;
+        gated.multi_draw_indirect = false;
+        gated.draw_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t count, std::uint32_t) {
+            split_draws.push_back({offset, count});
+        };
+        gated.draw_indexed_indirect = gated.draw_indirect;
+        {
+            CommandList multi;
+            CHECK(multi.execute_indirect({IndirectKind::draw, 16, 2, 1, 4, 0, 0}));
+            CHECK(multi.execute_indirect({IndirectKind::draw_indexed, 24, 3, 1, 8, 0, 0}));
+            CHECK(multi.close());
+            CHECK(replay(multi, VK_NULL_HANDLE, resolve, gated) == ReplayResult::success);
+            const std::vector<std::pair<VkDeviceSize, std::uint32_t>> expected_split{
+                {260, 1}, {276, 1}, {264, 1}, {288, 1}, {312, 1}};
+            CHECK(split_draws == expected_split);
+        }
+        gated.draw_indirect_count = nullptr;
+        gated.draw_indexed_indirect_count = nullptr;
+        {
+            CommandList counted_draw;
+            CHECK(counted_draw.execute_indirect({IndirectKind::draw, 16, 2, 1, 0, 2, 0}));
+            CHECK(counted_draw.close());
+            CHECK(replay(counted_draw, VK_NULL_HANDLE, resolve, gated) == ReplayResult::unsupported);
+
+            CommandList counted_indexed;
+            CHECK(counted_indexed.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 0, 2, 0}));
+            CHECK(counted_indexed.close());
+            CHECK(replay(counted_indexed, VK_NULL_HANDLE, resolve, gated) == ReplayResult::unsupported);
+
+            CommandList counted_zero;
+            CHECK(counted_zero.execute_indirect({IndirectKind::draw, 16, 0, 1, 0, 2, 0}));
+            CHECK(counted_zero.close());
+            CHECK(replay(counted_zero, VK_NULL_HANDLE, resolve, gated) == ReplayResult::success);
+        }
     }
 
     // Resizable BAR detection (D3D-96) on the heap layouts real cards report.

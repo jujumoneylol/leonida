@@ -947,8 +947,12 @@ public:
         replay_.update_buffer = vk.vkCmdUpdateBuffer;
         replay_.draw_indirect = vk.vkCmdDrawIndirect;
         replay_.draw_indexed_indirect = vk.vkCmdDrawIndexedIndirect;
-        replay_.draw_indirect_count = vk.vkCmdDrawIndirectCount;
-        replay_.draw_indexed_indirect_count = vk.vkCmdDrawIndexedIndirectCount;
+        // Gated on enabled device features via configure_indirect_draw(): vkGetDeviceProcAddr still hands out core
+        // Vulkan 1.2 drawIndirectCount entry points when the feature is off, and multiDrawIndirect defaults to the
+        // drawCount=1 fallback until enabled.
+        replay_.draw_indirect_count = nullptr;
+        replay_.draw_indexed_indirect_count = nullptr;
+        replay_.multi_draw_indirect = false;
         replay_.dispatch_indirect = vk.vkCmdDispatchIndirect;
         if (conditional_rendering) {  // a driver may hand out these pointers even when the extension is off
             replay_.begin_conditional_rendering = vk.vkCmdBeginConditionalRenderingEXT;
@@ -1119,6 +1123,14 @@ public:
                                     const VkPhysicalDeviceLimits& limits) {
         std::unique_lock lock(resource_mutex_);
         counted_dispatch_ = std::make_unique<IndirectDispatchCounter>(get, device_, memory, limits);
+    }
+    // Gates graphics ExecuteIndirect replay on the Vulkan features enabled on `device`: without multiDrawIndirect,
+    // fixed multi-draw falls back to drawCount=1 calls; without drawIndirectCount, counted draws are rejected with
+    // ReplayResult::unsupported rather than invoking vkCmdDrawIndirectCount / vkCmdDrawIndexedIndirectCount.
+    void configure_indirect_draw(bool multi_draw_indirect, bool draw_indirect_count) {
+        replay_.multi_draw_indirect = multi_draw_indirect;
+        replay_.draw_indirect_count = draw_indirect_count ? vk.vkCmdDrawIndirectCount : nullptr;
+        replay_.draw_indexed_indirect_count = draw_indirect_count ? vk.vkCmdDrawIndexedIndirectCount : nullptr;
     }
     VkDevice device() const { return device_; }
 

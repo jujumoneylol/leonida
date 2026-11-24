@@ -898,6 +898,9 @@ struct ReplayFunctions {
     PFN_vkCmdDrawIndirectCount draw_indirect_count = nullptr;
     PFN_vkCmdDrawIndexedIndirectCount draw_indexed_indirect_count = nullptr;
     PFN_vkCmdDispatchIndirect dispatch_indirect = nullptr;
+    // VkPhysicalDeviceFeatures::multiDrawIndirect is enabled. When false, fixed multi-draw ExecuteIndirect falls
+    // back to max_count single-draw calls so drawCount stays 1 (VUID-vkCmdDrawIndirect-drawCount-02718).
+    bool multi_draw_indirect = true;
     // A DISPATCH-only ExecuteIndirect signature with a GPU count buffer needs a compute prepass to clamp
     // the number of commands. The resulting scratch buffer is owned by the queue's timeline-retained batch.
     std::function<bool(VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t,
@@ -3056,8 +3059,9 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                                      p.source.buffer, p.source.buffer_offset + ind->count_offset,
                                                      ind->stride, ind->max_count, p.counted_dispatch))
                         return ReplayResult::unsupported;
-                } else if ((ind->kind == IndirectKind::draw && !vk.draw_indirect_count) ||
-                           (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect_count)) {
+                } else if (ind->max_count &&
+                           ((ind->kind == IndirectKind::draw && !vk.draw_indirect_count) ||
+                            (ind->kind == IndirectKind::draw_indexed && !vk.draw_indexed_indirect_count))) {
                     return ReplayResult::unsupported;
                 }
             } else {
@@ -4131,12 +4135,21 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                         vk.draw_indexed_indirect_count(command_buffer, p.binding.buffer, arguments,
                                                        p.source.buffer, count, ind->max_count, ind->stride);
                     }
-                } else {
+                } else if (vk.multi_draw_indirect || ind->max_count <= 1) {
                     if (ind->kind == IndirectKind::draw) {
                         vk.draw_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count, ind->stride);
                     } else if (ind->kind == IndirectKind::draw_indexed) {
                         vk.draw_indexed_indirect(command_buffer, p.binding.buffer, arguments, ind->max_count,
                                                  ind->stride);
+                    }
+                } else {
+                    for (std::uint32_t k = 0; k < ind->max_count; ++k) {
+                        const VkDeviceSize offset = arguments + VkDeviceSize(k) * ind->stride;
+                        if (ind->kind == IndirectKind::draw) {
+                            vk.draw_indirect(command_buffer, p.binding.buffer, offset, 1, ind->stride);
+                        } else if (ind->kind == IndirectKind::draw_indexed) {
+                            vk.draw_indexed_indirect(command_buffer, p.binding.buffer, offset, 1, ind->stride);
+                        }
                     }
                 }
             };

@@ -5300,6 +5300,8 @@ public:
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
+        state_.context->configure_indirect_draw(info.features.multiDrawIndirect == VK_TRUE,
+                                                info.draw_indirect_count);
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -9776,7 +9778,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
     enable12.timelineSemaphore = VK_TRUE;
     enable12.separateDepthStencilLayouts = VK_TRUE;
-    enable12.drawIndirectCount = chosen12.drawIndirectCount;
+    info.draw_indirect_count = chosen12.drawIndirectCount == VK_TRUE;
+    enable12.drawIndirectCount = info.draw_indirect_count ? VK_TRUE : VK_FALSE;
     info.buffer_device_address = chosen12.bufferDeviceAddress == VK_TRUE;
     enable12.bufferDeviceAddress = info.buffer_device_address ? VK_TRUE : VK_FALSE;
     info.storage_buffer_8bit = chosen12.storageBuffer8BitAccess == VK_TRUE;
