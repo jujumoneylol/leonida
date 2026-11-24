@@ -17146,6 +17146,52 @@ def restore_mix_inline_literal(ins, raw, literal):
     ins["enc"] = raw.hex()
 
 
+# Inline float constants encoded in RDNA2 src0 codes 0xF0..0xF8 (matching rdna2_decode.py / shader_ir.py).
+SDWA_INLINE_FLOAT = {
+    0xF0: 0.5, 0xF1: -0.5, 0xF2: 1.0, 0xF3: -1.0,
+    0xF4: 2.0, 0xF5: -2.0, 0xF6: 4.0, 0xF7: -4.0, 0xF8: 0.15915494,
+}
+
+
+def sdwa_inline_literal(raw8, printed, op, arg_count):
+    """Recover the native inline-constant src0 code when LLVM 19 prints an 8-byte SDWA instruction as 12 bytes.
+
+    LLVM 19.1.7's gfx1013 disassembler turns an inline float constant on integer-input SDWA VOP1 instructions
+    (such as v_cvt_f16_u16_sdwa / v_cvt_f16_i16_sdwa in ps_sdwa_f16_const) into a 12-byte encoding with
+    src0=0xff and a trailing 32-bit literal word. ``raw8`` is the 8 stored bytes at the instruction's offset,
+    ``printed`` the 12-byte printed encoding. Only accepted when raw8 is a genuine SDWA instruction (raw8[0]==0xf9)
+    with scalar/inline bit s0=1 (raw8[6] & 0x80) and an inline constant code in raw8[4] (0x80..0xf8), printed[4]==0xff,
+    and every other field of raw8 matches printed[:8] via same_encoding."""
+    if len(raw8) != 8 or len(printed) != 12 or raw8[0] != 0xF9 or printed[0] != 0xF9:
+        return None
+    if printed[4] != 0xFF or not (raw8[6] & 0x80):
+        return None
+    code = raw8[4]
+    if not (0x80 <= code <= 0xD0 or code in SDWA_INLINE_FLOAT):
+        return None
+    patched = printed[:4] + raw8[4:5] + printed[5:8]
+    if not same_encoding(raw8, patched, op, arg_count):
+        return None
+    return code
+
+
+def restore_sdwa_inline_literal(ins, raw8, code):
+    """Restore ``ins``'s src0 operand and 8-byte encoding for an SDWA instruction accepted by sdwa_inline_literal."""
+    prev = ins["args"][1] if len(ins["args"]) > 1 and isinstance(ins["args"][1], dict) else {}
+    if code <= 0xC0:
+        arg = {"k": "imm", "v": code - 0x80}
+    elif code <= 0xD0:
+        arg = {"k": "imm", "v": -(code - 0xC0)}
+    else:
+        arg = {"k": "fimm", "v": SDWA_INLINE_FLOAT[code]}
+    for flag in ("neg", "abs", "sext"):
+        if prev.get(flag):
+            arg[flag] = True
+    if len(ins["args"]) > 1:
+        ins["args"][1] = arg
+    ins["enc"] = raw8.hex()
+
+
 def output_signature(path, name):
     """OSG1 elements as (register, system value), one per register (first element wins)."""
     d = shader_container(path, name)
@@ -17338,6 +17384,12 @@ def check_printed_encodings(path, info):
                 restore_mix_inline_literal(ins, raw12, literal)
                 shift += 4
                 continue
+            raw8 = blob[ins["pc"]:ins["pc"] + 8]
+            sdwa_code = sdwa_inline_literal(raw8, enc, ins["op"], len(ins["args"]))
+            if sdwa_code is not None:
+                restore_sdwa_inline_literal(ins, raw8, sdwa_code)
+                shift -= 4
+                continue
             raise Unsupported(f"{ins['op']} at 0x{ins['pc']:x}: the blob holds {raw.hex()}, LLVM printed "
                               f"{enc.hex()} (a field the disassembler dropped)")
 
@@ -17403,6 +17455,11 @@ def translate(path):
                 if literal is not None:
                     restore_mix_inline_literal(ins, blob[at:at + 12], literal)
                     enc = blob[at:at + 12]          # the 12 bytes the decoder read: the next one starts after them
+                    break
+                sdwa_code = sdwa_inline_literal(blob[at:at + 8], enc, op, operand_count)
+                if sdwa_code is not None:
+                    restore_sdwa_inline_literal(ins, blob[at:at + 8], sdwa_code)
+                    enc = blob[at:at + 8]           # the 8 bytes stored in the blob: the next one starts after them
                     break
                 at += 4
                 skipped += 4
