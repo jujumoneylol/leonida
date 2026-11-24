@@ -1090,6 +1090,37 @@ int main() {
     check(is_packaged() == false, "XPackageIsPackagedProcess respects LEONIDA_PACKAGED=0 override");
     SetEnvironmentVariableA("LEONIDA_PACKAGED", nullptr);
 
+    using AppMemoryLimitFn = uint64_t(__stdcall*)();
+    auto app_mem_limit = get<AppMemoryLimitFn>("XSystemGetAppMemoryUsageLimit");
+    check(app_mem_limit != nullptr, "XSystemGetAppMemoryUsageLimit is registered");
+    if (app_mem_limit) {
+        char saved_env[64]{};
+        const DWORD saved_n = GetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", saved_env, sizeof(saved_env));
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", nullptr);
+        MEMORYSTATUSEX ms{sizeof(ms)};
+        const uint64_t expected_default = GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys : (12ULL << 30);
+        check(app_mem_limit() == expected_default, "XSystemGetAppMemoryUsageLimit reports host RAM by default");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "6144");
+        check(app_mem_limit() == 6144ULL * 1024ULL * 1024ULL,
+              "XSystemGetAppMemoryUsageLimit honors LEONIDA_TITLE_MEMORY_MB=6144");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "512");
+        check(app_mem_limit() == 2048ULL * 1024ULL * 1024ULL,
+              "XSystemGetAppMemoryUsageLimit clamps LEONIDA_TITLE_MEMORY_MB below 2048 MiB");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "131072");
+        check(app_mem_limit() == 65536ULL * 1024ULL * 1024ULL,
+              "XSystemGetAppMemoryUsageLimit clamps LEONIDA_TITLE_MEMORY_MB above 65536 MiB");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "notanumber");
+        check(app_mem_limit() == expected_default,
+              "XSystemGetAppMemoryUsageLimit ignores invalid LEONIDA_TITLE_MEMORY_MB");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "6144mb");
+        check(app_mem_limit() == expected_default,
+              "XSystemGetAppMemoryUsageLimit ignores LEONIDA_TITLE_MEMORY_MB with trailing text");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", "-4096");
+        check(app_mem_limit() == expected_default,
+              "XSystemGetAppMemoryUsageLimit ignores negative LEONIDA_TITLE_MEMORY_MB");
+        SetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", (saved_n > 0 && saved_n < sizeof(saved_env)) ? saved_env : nullptr);
+    }
+
     // Work on the thread pool, completions dispatched by the "game loop" on this thread.
     auto create = get<QueueCreateFn>("XTaskQueueCreate");
     auto close = get<QueueCloseFn>("XTaskQueueCloseHandle");

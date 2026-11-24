@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -699,8 +700,22 @@ HRESULT __stdcall XSystemGetConsoleId(size_t size, char* out, size_t* used) {
     return S_OK;
 }
 
-// uint64_t XSystemGetAppMemoryUsageLimit(). Reports total physical RAM, or 12 GB fallback for Series X.
+// uint64_t XSystemGetAppMemoryUsageLimit(). Reports total physical RAM (or 12 GB fallback for Series X),
+// optionally overridden by LEONIDA_TITLE_MEMORY_MB (clamped to 2048..65536 MiB) so constrained hosts can prevent
+// the title from sizing pools above what the machine can hold.
 uint64_t __stdcall XSystemGetAppMemoryUsageLimit() {
+    char env[32]{};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", env, sizeof(env));
+    if (n > 0 && n < sizeof(env) && env[0] != '-' && env[0] != '+') {
+        errno = 0;
+        char* end = nullptr;
+        unsigned long long mib = std::strtoull(env, &end, 10);
+        if (errno == 0 && end != env && *end == '\0' && mib > 0) {
+            if (mib < 2048ULL) mib = 2048ULL;
+            if (mib > 65536ULL) mib = 65536ULL;
+            return static_cast<uint64_t>(mib) * 1024ULL * 1024ULL;
+        }
+    }
     MEMORYSTATUSEX ms{sizeof(ms)};
     if (GlobalMemoryStatusEx(&ms)) return ms.ullTotalPhys;
     return 12ULL * 1024 * 1024 * 1024;

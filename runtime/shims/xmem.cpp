@@ -19,8 +19,10 @@
 #include <psapi.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -158,6 +160,19 @@ BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
     uint64_t total_memory = 12ULL * 1024 * 1024 * 1024;
     if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys != 0) {
         total_memory = ms.ullTotalPhys;
+    }
+    // Optional override (matching XSystemGetAppMemoryUsageLimit) so memory-constrained hosts can cap title pools.
+    char env[32]{};
+    const DWORD env_n = GetEnvironmentVariableA("LEONIDA_TITLE_MEMORY_MB", env, sizeof(env));
+    if (env_n > 0 && env_n < sizeof(env) && env[0] != '-' && env[0] != '+') {
+        errno = 0;
+        char* end = nullptr;
+        unsigned long long mib = std::strtoull(env, &end, 10);
+        if (errno == 0 && end != env && *end == '\0' && mib > 0) {
+            if (mib < 2048ULL) mib = 2048ULL;
+            if (mib > 65536ULL) mib = 65536ULL;
+            total_memory = static_cast<uint64_t>(mib) * 1024ULL * 1024ULL;
+        }
     }
 
     uint8_t* bytes = static_cast<uint8_t*>(stats);
