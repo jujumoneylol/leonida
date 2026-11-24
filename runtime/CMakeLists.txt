@@ -2649,7 +2649,15 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_indirect_zero COMMAND d3d12_indirect_zero_test)
     set_tests_properties(d3d12_indirect_zero PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(d3d12_node_mask PROPERTIES SKIP_RETURN_CODE 77)
-    set_tests_properties(d3d12_indirect_zero PROPERTIES SKIP_RETURN_CODE 77)
+
+    # GPU-driven graphics ExecuteIndirect (DRAW / DRAW_INDEXED, fixed & count buffer) against host D3D12.
+    add_executable(d3d12_indirect_draw_test test/d3d12_indirect_draw_test.cpp)
+    target_link_libraries(d3d12_indirect_draw_test PRIVATE gta6rt_d3d12_com d3d12 dxgi dxguid)
+    target_compile_definitions(d3d12_indirect_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_indirect_draw_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_indirect_draw COMMAND d3d12_indirect_draw_test)
+    set_tests_properties(d3d12_indirect_draw PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # CopyResource / CopyTextureRegion between BC and its uncompressed equivalent (and depth <-> colour) against the
     # host runtime and WARP; run explicitly on a Vulkan GPU.

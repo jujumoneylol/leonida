@@ -604,6 +604,12 @@ struct ExecuteIndirect {
     // as it is.
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
+    // kind == draw / draw_indexed: snapshot of the graphics state in effect at ExecuteIndirect, as Draw records it, so
+    // replay begins dynamic rendering and binds the pipeline, targets, viewport/scissor, push constants and
+    // vertex/index buffers before vkCmdDraw*Indirect*. When has_draw is false (e.g. max_count == 0 or a bare IR test
+    // that opened its own render pass), replay emits only the indirect call.
+    bool has_draw = false;
+    Draw draw{};
 };
 
 // Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).

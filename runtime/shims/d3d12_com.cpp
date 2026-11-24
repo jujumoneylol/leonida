@@ -871,6 +871,16 @@ public:
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
             cmd.user_data = compute_.data;
+        } else if ((kind == leonida::IndirectKind::draw || kind == leonida::IndirectKind::draw_indexed) &&
+                   max_command_count && graphics_pipeline_ && graphics_.layout && topology_) {
+            note_direct_heap_indexing(graphics_.layout);
+            if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
+            cmd.has_draw = true;
+            cmd.draw = leonida::Draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_,
+                                     viewport_, scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_,
+                                     kind == leonida::IndirectKind::draw_indexed, 0, 0, 0, 0, 0};
+            cmd.draw.depth_bounds_min = depth_bounds_min_;
+            cmd.draw.depth_bounds_max = depth_bounds_max_;
         }
         check(list_.execute_indirect(cmd));
     }
